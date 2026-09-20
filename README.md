@@ -1,56 +1,65 @@
 # Challenge Box Timer
 
-Web-based timer for Challenge Box games. Each Challenge Box has its own QR code; when a team scans it, they register, solve a riddle to start the timer, and enter a solution to stop it. Team names and times are saved to a shared leaderboard.
+Web-App für Challenge Box Games: Team-Registrierung per QR-Code, digitales Briefing, servergestützter Countdown und Operator-Dashboard. Die Benutzeroberfläche ist auf Deutsch, im Look von [challengeboxgames.ch](https://challengeboxgames.ch/).
 
-## How it works
+## Ablauf (Spielerseite)
 
-1. **Scan** — each QR code points to `https://<your-domain>/#/<box-id>` (e.g. `/#/alpha`).
-2. **Register** — the team enters a team name and the number of players.
-3. **Start** — the box's riddle is shown; typing the correct answer starts the timer.
-4. **Solve** — while the timer runs, the team enters the solution word/number. The correct answer stops the clock.
-5. **Leaderboard** — the team name and time are saved to the backend and ranked against other teams.
+1. **QR-Code scannen** — jeder QR-Code zeigt auf `https://<domain>/#/vinci` oder `https://<domain>/#/zodiak`.
+2. **Registrierung** — Teamname + Set-Nummer (z. B. CH01–CH15) aus einer Dropdown-Liste. Bereits belegte Sets werden ausgeblendet, Doppelnennungen werden serverseitig verhindert.
+3. **Digitales Briefing** — wischbare Infoseiten (iPad/AR, Manuskript, allgemeine Hinweise).
+4. **«Bereit, die Challenge anzunehmen?»** — mit Ja geht es zur ersten Frage.
+5. **Startfrage** — z. B. «Wie lautet das Todesjahr des grossen Meisters?» (Antwort: 1519). Erst die richtige Antwort startet den Countdown (Vinci: 120 Min, Zodiak: 90 Min) — so öffnet kein Team die erste Box, ohne dass die Zeit läuft.
+6. **Während des Spiels** — unter dem Countdown steht dauerhaft das Eingabefeld für den finalen Code (Summe der beiden Code-Teile, korreliert mit der Set-Nummer).
+7. **Spielende** — richtige Summe stoppt die Zeit. Erfolgsmeldung + Rangliste.
 
-Boxes (riddle, start answer, solution) are defined in the `BOXES` object at the top of `src/App.jsx`. Add or edit boxes there — no other changes needed.
+## Reconnect / Display aus
 
-## Tech stack
+Der Countdown wird **serverseitig** gemessen (Zeitstempel beim Start). Display ausschalten, Browser schliessen oder die Seite neu laden beeinträchtigt die Zeit nicht — beim erneuten Öffnen wird der verbleibende Countdown vom Server geladen (Team-ID liegt im lokalen Speicher des Geräts). Während des Spiels synchronisiert die App zusätzlich alle 15 Sekunden und beim Aufwecken des Displays.
 
-- **Frontend**: React + Vite, styled after [challengeboxgames.ch](https://challengeboxgames.ch/)
-- **Backend**: Express (Node.js) storing results in `data.json`
+## Operator-Dashboard
 
-## Getting started
+`https://<domain>/#/operator` — Übersicht aller Teams (Teamname, Spiel, Set, Status, Restzeit), aktualisiert alle 5 Sekunden, inklusive Zurücksetzen von Teams (gibt ein Set wieder frei).
+
+## Sicherheit der Lösungen
+
+Start-Antworten und die Code-Summen pro Set liegen **ausschliesslich in `server.js`** (`GAMES`-Objekt, `startAnswer` und `setSums`) und werden nie an den Browser gesendet. Die App prüft jede Antwort serverseitig.
+
+Die dort hinterlegten Werte sind Platzhalter und müssen mit den echten Codes ersetzt werden.
+
+## Setup
 
 ```bash
-# install dependencies
 npm install
 
-# terminal 1 — start the backend (results API on port 3001)
+# Terminal 1 — Backend (API auf Port 3001)
 npm run server
 
-# terminal 2 — start the frontend dev server
+# Terminal 2 — Frontend (Dev-Server)
 npm run dev
 ```
 
-Open the URL Vite prints (usually `http://localhost:5173`). The dev server proxies `/api` calls to the backend (see `vite.config.js`).
+Die Results werden in `data.json` gespeichert (liegt in `.gitignore`).
 
-If the backend is not running, the app falls back to saving results in the browser's local storage, so the timer still works for testing.
+## QR-Codes generieren
 
-## Generating QR codes
+Pro Spiel ein QR-Code auf die App-URL:
 
-Point any QR code generator at the box URLs, one per box:
+- `https://<domain>/#/vinci`
+- `https://<domain>/#/zodiak`
 
-- `https://<your-domain>/#/alpha`
-- `https://<your-domain>/#/bravo`
-- `https://<your-domain>/#/charlie`
+## Skripte
 
-## Scripts
+| Befehl          | Beschreibung                              |
+| --------------- | ----------------------------------------- |
+| `npm run dev`   | Frontend-Dev-Server starten               |
+| `npm run server`| Express-Backend auf Port 3001 starten     |
+| `npm run build` | Produktions-Build erstellen               |
+| `npm run lint`  | Code mit ESLint prüfen                    |
 
-| Command           | What it does                          |
-| ----------------- | ------------------------------------- |
-| `npm run dev`     | Start the frontend dev server         |
-| `npm run server`  | Start the Express backend on port 3001 |
-| `npm run build`   | Build the frontend for production     |
-| `npm run preview` | Preview the production build          |
-| `npm run lint`    | Lint the code with ESLint             |
+## Tech Stack
+
+- **Frontend:** React + Vite
+- **Backend:** Express (Node.js), Datenspeicher `data.json`
 
 ## License
 

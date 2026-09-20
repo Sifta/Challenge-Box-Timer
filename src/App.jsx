@@ -3,293 +3,643 @@ import { useEffect, useRef, useState } from 'react';
 /* ============================================================
    CHALLENGE BOX TIMER
    ------------------------------------------------------------
-   HOW IT WORKS
-   - Each QR code encodes a URL like  https://<your-domain>/#/alpha
-     (one QR code per box, each with its own puzzle + solution).
-   - Scan -> team registration -> puzzle text -> answer starts
-     the timer -> solution stops it -> team + time saved to the
-     backend leaderboard.
-   - Edit the BOXES object below to add/change boxes.
+   Ablauf: QR-Code-Scan (#/vinci oder #/zodiak)
+     -> Team-Registrierung (Teamname + Set-Nummer)
+     -> Digitales Briefing (wischbare Infoseiten)
+     -> "Bereit, die Challenge anzunehmen?" (Ja / Nein)
+     -> Startfrage -> richtige Antwort startet den Countdown
+     -> Countdown (120 / 90 Min) + dauerhaftes Eingabefeld
+        für den finalen Code (Summe der beiden Codes)
+     -> richtiger Code stoppt die Zeit -> Erfolgsmeldung
+
+   Alle Lösungen werden NUR im Backend geprüft (server.js).
+   Die Zeit wird serverseitig gemessen: Display aus, Browser
+   schliessen oder Neu laden beeinträchtigt den Countdown nicht
+   (Reconnect über die gespeicherte Team-ID).
+
+   Operator-Dashboard: #/operator
    ============================================================ */
 
-const BOXES = {
-  alpha: {
-    title: 'Challenge Box Alpha',
-    prompt:
-      'I speak without a mouth and hear without ears. I have no body, but I come alive with wind. What am I?',
-    startAnswer: 'echo', // correct answer here starts the timer
-    solution: '7', // word/number that stops the timer
+/* Öffentliche Spiel-Infos für die Anzeige.
+   Die Antworten stehen bewusst NICHT hier (siehe server.js). */
+const GAMES = {
+  vinci: {
+    title: 'Vinci',
+    durationLabel: '120 Minuten',
+    setPrefix: 'CH',
+    startQuestion: 'Wie lautet das Todesjahr des grossen Meisters?',
+    startHint: 'Dieser Code öffnet das Vorhängeschloss der ersten Box.',
   },
-  bravo: {
-    title: 'Challenge Box Bravo',
-    prompt:
-      'The more of me you take, the more you leave behind. What am I? When you know it, type the answer to begin.',
-    startAnswer: 'footsteps',
-    solution: '42',
-  },
-  charlie: {
-    title: 'Challenge Box Charlie',
-    prompt:
-      'I have keys but open no locks. I have space but no room. You can enter, but you cannot go outside. What am I?',
-    startAnswer: 'keyboard',
-    solution: 'gold',
+  zodiak: {
+    title: 'Zodiak',
+    durationLabel: '90 Minuten',
+    setPrefix: 'ZD',
+    startQuestion: 'Wie viele Tierkreiszeichen gibt es?',
+    startHint: 'Diese Zahl öffnet das Vorhängeschloss der ersten Box.',
   },
 };
 
-// Backend base URL. In dev, the Vite proxy forwards /api to the
-// Express server (see vite.config.js). If the backend is not
-// reachable, results are stored locally in the browser instead.
-const API = '/api';
+const BRIEFING_PAGES = [
+  {
+    title: 'iPad & Augmented Reality',
+    text: 'Nutzt das iPad für die Augmented-Reality-Erlebnisse. Haltet das Gerät ruhig und folgt den Anweisungen auf dem Bildschirm. Behandelt es sorgfältig.',
+  },
+  {
+    title: 'Das Manuskript',
+    text: 'Lest das Manuskript sorgfältig und vollständig. Alle Informationen, die ihr für die Challenge braucht, stehen darin. Verliert es nicht aus den Augen.',
+  },
+  {
+    title: 'Wichtige Hinweise',
+    text: 'Wendet keine rohe Gewalt an – weder an den Kisten noch am Material. Alles lässt sich mit Logik und Teamwork lösen. Helft einander und habt Spass.',
+  },
+];
+
+/* ---------- API ---------- */
+
+async function api(path, options = {}) {
+  const res = await fetch(`/api${path}`, {
+    headers: { 'Content-Type': 'application/json' },
+    ...options,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Serverfehler');
+  return data;
+}
 
 /* ---------- helpers ---------- */
 
-function getBoxIdFromHash() {
+function getRoute() {
   const match = window.location.hash.match(/^#\/([a-z0-9-]+)/i);
-  return match ? match[1].toLowerCase() : null;
+  return match ? match[1].toLowerCase() : '';
 }
 
-function normalize(text) {
-  return text.trim().toLowerCase().replace(/\s+/g, ' ');
+function formatCountdown(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const hours = String(Math.floor(total / 3600)).padStart(2, '0');
+  const minutes = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
+  const seconds = String(total % 60).padStart(2, '0');
+  return `${hours}:${minutes}:${seconds}`;
 }
 
-function formatTime(ms) {
-  const totalSeconds = Math.floor(ms / 1000);
-  const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
-  const seconds = String(totalSeconds % 60).padStart(2, '0');
-  const tenths = String(Math.floor((ms % 1000) / 100));
-  return `${minutes}:${seconds}.${tenths}`;
+/* ============================================================
+   Bildschirme
+   ============================================================ */
+
+function ConnectionError({ message }) {
+  return (
+    <div className="cbt-card">
+      <p className="cbt-eyebrow">Verbindungsproblem</p>
+      <h1 className="cbt-title">Server nicht erreichbar</h1>
+      <p className="cbt-sub">
+        {message}. Bitte prüfen, ob das Backend läuft ({`node server.js`}), und die
+        Seite neu laden.
+      </p>
+    </div>
+  );
 }
 
-async function fetchLeaderboard(boxId) {
-  try {
-    const res = await fetch(`${API}/leaderboard/${boxId}`);
-    if (!res.ok) throw new Error('backend unavailable');
-    return await res.json();
-  } catch {
-    try {
-      return JSON.parse(localStorage.getItem(`cbt-board-${boxId}`)) || [];
-    } catch {
-      return [];
-    }
-  }
-}
-
-async function saveResult(boxId, teamName, players, timeMs) {
-  const entry = { teamName, players, timeMs, finishedAt: new Date().toISOString() };
-  try {
-    const res = await fetch(`${API}/finish`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ boxId, ...entry }),
-    });
-    if (!res.ok) throw new Error('backend unavailable');
-  } catch {
-    const key = `cbt-board-${boxId}`;
-    const board = JSON.parse(localStorage.getItem(key) || '[]');
-    board.push(entry);
-    localStorage.setItem(key, JSON.stringify(board));
-  }
-}
-
-/* ---------- screens ---------- */
-
-function Register({ box, onConfirm }) {
+function Register({ game, gameId, onRegistered }) {
   const [teamName, setTeamName] = useState('');
-  const [players, setPlayers] = useState('2');
+  const [players, setPlayers] = useState('');
+  const [freeSets, setFreeSets] = useState(null);
+  const [setId, setSetId] = useState('');
   const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
 
-  const submit = (e) => {
+  useEffect(() => {
+    api(`/games/${gameId}`)
+      .then((d) => setFreeSets(d.freeSets))
+      .catch((e) => setError(e.message));
+  }, [gameId]);
+
+  const submit = async (e) => {
     e.preventDefault();
-    if (!teamName.trim()) {
-      setError('Please choose a team name.');
-      return;
+    setError('');
+    if (!teamName.trim()) return setError('Bitte einen Teamnamen eingeben.');
+    if (!setId) return setError('Bitte eine Set-Nummer auswählen.');
+    try {
+      setSubmitting(true);
+      const team = await api('/register', {
+        method: 'POST',
+        body: JSON.stringify({
+          game: gameId,
+          teamName,
+          set: Number(setId),
+          players: players ? Number(players) : null,
+        }),
+      });
+      onRegistered(team);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSubmitting(false);
     }
-    const count = parseInt(players, 10);
-    if (!Number.isInteger(count) || count < 1 || count > 50) {
-      setError('Player count must be between 1 and 50.');
-      return;
-    }
-    onConfirm(teamName.trim(), count);
   };
 
   return (
     <div className="cbt-card">
-      <p className="cbt-eyebrow">Team registration</p>
-      <h1 className="cbt-title">{box.title}</h1>
+      <p className="cbt-eyebrow">Team-Registrierung</p>
+      <h1 className="cbt-title">{game.title}</h1>
       <p className="cbt-sub">
-        Welcome, adventurers. Register your team to unlock your challenge.
+        Willkommen bei eurer Challenge ({game.durationLabel}). Registriert euch,
+        um loszulegen.
       </p>
       <form onSubmit={submit} className="cbt-form">
         <label className="cbt-label">
-          Team name
+          Teamname
           <input
             type="text"
             value={teamName}
             onChange={(e) => setTeamName(e.target.value)}
-            placeholder="e.g. The Golden Explorers"
+            placeholder="z. B. Die goldenen Entdecker"
             maxLength={40}
             autoFocus
           />
         </label>
         <label className="cbt-label">
-          How many people are playing?
+          Set-Nummer
+          <select
+            value={setId}
+            onChange={(e) => setSetId(e.target.value)}
+            disabled={!freeSets}
+          >
+            <option value="">
+              {freeSets === null ? 'Lade Sets…' : 'Bitte auswählen'}
+            </option>
+            {(freeSets || []).map((label) => (
+              <option key={label} value={Number(label.slice(2))}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="cbt-label">
+          Anzahl Spieler (optional)
           <input
             type="number"
             min="1"
             max="50"
             value={players}
             onChange={(e) => setPlayers(e.target.value)}
+            placeholder="z. B. 4"
           />
         </label>
         {error && <p className="cbt-error">{error}</p>}
-        <button type="submit" className="cbt-btn">
-          Confirm
+        <button type="submit" className="cbt-btn" disabled={submitting}>
+          Registrieren
         </button>
       </form>
     </div>
   );
 }
 
-function Riddle({ box, onStart }) {
-  const [answer, setAnswer] = useState('');
-  const [wrong, setWrong] = useState(false);
+function Briefing({ game, onDone }) {
+  const [page, setPage] = useState(0);
+  const touchStart = useRef(null);
+  const last = page === BRIEFING_PAGES.length - 1;
 
-  const submit = (e) => {
-    e.preventDefault();
-    if (normalize(answer) === normalize(box.startAnswer)) {
-      onStart();
-    } else {
-      setWrong(true);
-      setTimeout(() => setWrong(false), 600);
-    }
+  const onTouchStart = (e) => {
+    touchStart.current = e.touches[0].clientX;
+  };
+  const onTouchEnd = (e) => {
+    if (touchStart.current === null) return;
+    const dx = e.changedTouches[0].clientX - touchStart.current;
+    if (dx < -40 && page < BRIEFING_PAGES.length - 1) setPage(page + 1);
+    if (dx > 40 && page > 0) setPage(page - 1);
+    touchStart.current = null;
   };
 
   return (
-    <div className="cbt-card">
-      <p className="cbt-eyebrow">Your challenge</p>
-      <h1 className="cbt-title">{box.title}</h1>
-      <p className="cbt-prompt">{box.prompt}</p>
-      <form onSubmit={submit} className="cbt-form">
-        <label className="cbt-label">
-          Type your answer to start the timer
-          <input
-            type="text"
-            value={answer}
-            onChange={(e) => setAnswer(e.target.value)}
-            placeholder="Your answer..."
-            className={wrong ? 'cbt-shake cbt-wrong' : ''}
-            autoFocus
-          />
-        </label>
-        {wrong && <p className="cbt-error">Not quite — discuss and try again.</p>}
-        <button type="submit" className="cbt-btn">
-          Start the timer
-        </button>
-      </form>
-    </div>
-  );
-}
-
-function Running({ box, onStop }) {
-  const [elapsed, setElapsed] = useState(0);
-  const [answer, setAnswer] = useState('');
-  const [wrong, setWrong] = useState(false);
-  const startRef = useRef(Date.now());
-
-  useEffect(() => {
-    const id = setInterval(() => setElapsed(Date.now() - startRef.current), 47);
-    return () => clearInterval(id);
-  }, []);
-
-  const submit = (e) => {
-    e.preventDefault();
-    if (normalize(answer) === normalize(box.solution)) {
-      onStop(Date.now() - startRef.current);
-    } else {
-      setWrong(true);
-      setTimeout(() => setWrong(false), 600);
-    }
-  };
-
-  return (
-    <div className="cbt-card">
-      <p className="cbt-eyebrow cbt-eyebrow-live">
-        <span className="cbt-dot" /> Timer running
-      </p>
-      <div className="cbt-timer" role="timer" aria-live="off">
-        {formatTime(elapsed)}
+    <div className="cbt-card" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+      <p className="cbt-eyebrow">Digitales Briefing · {game.title}</p>
+      <div className="cbt-swipe" key={page}>
+        <p className="cbt-swipe-number">{String(page + 1).padStart(2, '0')}</p>
+        <h1 className="cbt-title">{BRIEFING_PAGES[page].title}</h1>
+        <p className="cbt-sub">{BRIEFING_PAGES[page].text}</p>
       </div>
-      <p className="cbt-sub">Solve the challenge. Enter the solution word or number.</p>
+      <div className="cbt-dots">
+        {BRIEFING_PAGES.map((_, i) => (
+          <span key={i} className={i === page ? 'cbt-dot-active' : ''} />
+        ))}
+      </div>
+      <div className="cbt-btn-row">
+        {page > 0 && (
+          <button className="cbt-btn cbt-btn-ghost" onClick={() => setPage(page - 1)}>
+            Zurück
+          </button>
+        )}
+        <button className="cbt-btn" onClick={() => (last ? onDone() : setPage(page + 1))}>
+          {last ? 'Weiter' : 'Nächste Seite'}
+        </button>
+      </div>
+      <p className="cbt-sub cbt-sub-small">Zum Blättern wischen</p>
+    </div>
+  );
+}
+
+function Ready({ game, onYes, onNo }) {
+  return (
+    <div className="cbt-card">
+      <p className="cbt-eyebrow">{game.title}</p>
+      <h1 className="cbt-title">Bereit, die Challenge anzunehmen?</h1>
+      <p className="cbt-sub">
+        Sobald ihr mit Ja bestätigt, erscheint die erste Frage. Euer Countdown
+        läuft noch nicht – erst die richtige Antwort startet die Uhr.
+      </p>
+      <div className="cbt-btn-row">
+        <button className="cbt-btn" onClick={onYes}>
+          Ja
+        </button>
+        <button className="cbt-btn cbt-btn-ghost" onClick={onNo}>
+          Nein
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Question({ game, team, onSolved }) {
+  const [answer, setAnswer] = useState('');
+  const [wrong, setWrong] = useState(false);
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError('');
+    setSubmitting(true);
+    try {
+      const updated = await api('/start', {
+        method: 'POST',
+        body: JSON.stringify({ teamId: team.id, answer }),
+      });
+      onSolved(updated);
+    } catch (err) {
+      setWrong(true);
+      setError(err.message === 'Falsche Antwort' ? 'Nicht ganz – beratet euch und versucht es erneut.' : err.message);
+      setTimeout(() => setWrong(false), 600);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="cbt-card">
+      <p className="cbt-eyebrow">Erste Frage</p>
+      <h1 className="cbt-title">{game.startQuestion}</h1>
+      <p className="cbt-sub">{game.startHint}</p>
       <form onSubmit={submit} className="cbt-form">
         <label className="cbt-label">
-          Solution
+          Eure Antwort
           <input
             type="text"
+            inputMode="numeric"
             value={answer}
             onChange={(e) => setAnswer(e.target.value)}
-            placeholder="Solution word or number..."
+            placeholder="Antwort eingeben…"
             className={wrong ? 'cbt-shake cbt-wrong' : ''}
             autoFocus
           />
         </label>
-        {wrong && <p className="cbt-error">That is not the solution. Keep going!</p>}
-        <button type="submit" className="cbt-btn">
-          Stop the timer
+        {error && <p className="cbt-error">{error}</p>}
+        <button type="submit" className="cbt-btn" disabled={submitting}>
+          Countdown starten
         </button>
       </form>
     </div>
   );
 }
 
-function Finished({ box, teamName, timeMs, onRestart }) {
+function Playing({ team, onFinish }) {
+  const [sync, setSync] = useState({ remainingMs: team.remainingMs, fetchedAt: Date.now() });
+  const [remaining, setRemaining] = useState(team.remainingMs);
+  const [code, setCode] = useState('');
+  const [wrong, setWrong] = useState(false);
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const teamId = team.id;
+
+  /* lokale Uhr ticken lassen */
+  useEffect(() => {
+    const id = setInterval(() => {
+      setRemaining(Math.max(0, sync.remainingMs - (Date.now() - sync.fetchedAt)));
+    }, 250);
+    return () => clearInterval(id);
+  }, [sync]);
+
+  /* regelmässig und beim Aufwecken mit dem Server abgleichen */
+  useEffect(() => {
+    const resync = async () => {
+      try {
+        const t = await api(`/team/${teamId}`);
+        setSync({ remainingMs: t.remainingMs, fetchedAt: Date.now() });
+        setRemaining(t.remainingMs);
+      } catch {
+        /* offline: lokale Uhr läuft weiter */
+      }
+    };
+    const id = setInterval(resync, 15000);
+    document.addEventListener('visibilitychange', resync);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', resync);
+    };
+  }, [teamId]);
+
+  const submitCode = async (e) => {
+    e.preventDefault();
+    setError('');
+    setSubmitting(true);
+    try {
+      const finished = await api('/finish', {
+        method: 'POST',
+        body: JSON.stringify({ teamId, code }),
+      });
+      onFinish(finished);
+    } catch (err) {
+      setWrong(true);
+      setError(
+        err.message === 'Falscher Code'
+          ? 'Das ist nicht der richtige Code. Weiter geht’s!'
+          : err.message,
+      );
+      setTimeout(() => setWrong(false), 600);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const low = remaining < 10 * 60 * 1000;
+  const over = remaining <= 0;
+
+  return (
+    <div className="cbt-card">
+      <p className={`cbt-eyebrow ${over ? '' : 'cbt-eyebrow-live'}`}>
+        {!over && <span className="cbt-dot" />}
+        {over ? 'Zeit abgelaufen' : 'Countdown läuft'} · Team {team.teamName} · Set{' '}
+        {team.setLabel}
+      </p>
+      <div className={`cbt-timer ${low ? 'cbt-timer-low' : ''}`}>{formatCountdown(remaining)}</div>
+      {over ? (
+        <p className="cbt-sub">
+          Eure Zeit ist abgelaufen. Gebt euren finalen Code trotzdem ein, sofern
+          ihr ihn gefunden habt.
+        </p>
+      ) : (
+        <p className="cbt-sub">
+          Öffnet nacheinander die Kisten. Jede offene Kiste verrät den Code für
+          die nächste. Wenn ihr beide Codes gefunden habt, gebt unten deren Summe
+          ein.
+        </p>
+      )}
+      <form onSubmit={submitCode} className="cbt-form">
+        <label className="cbt-label">
+          Finaler Code (Summe der beiden Codes)
+          <input
+            type="text"
+            inputMode="numeric"
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+            placeholder="z. B. 495"
+            className={wrong ? 'cbt-shake cbt-wrong' : ''}
+          />
+        </label>
+        {error && <p className="cbt-error">{error}</p>}
+        <button type="submit" className="cbt-btn" disabled={submitting}>
+          Code prüfen
+        </button>
+      </form>
+      <p className="cbt-sub cbt-sub-small">
+        Display aus oder Seite neu laden? Kein Problem – euer Countdown läuft
+        serverseitig weiter.
+      </p>
+    </div>
+  );
+}
+
+function Finished({ game, team, onRestart }) {
   const [board, setBoard] = useState(null);
 
-  const load = async () => {
-    const id = getBoxIdFromHash();
-    const entries = await fetchLeaderboard(id);
-    entries.sort((a, b) => a.timeMs - b.timeMs);
-    setBoard(entries);
-  };
-
   useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    api(`/leaderboard/${team.game}`)
+      .then(setBoard)
+      .catch(() => setBoard([]));
+  }, [team.game]);
 
   return (
     <div className="cbt-card">
-      <p className="cbt-eyebrow">Challenge complete</p>
-      <h1 className="cbt-title">Well done, {teamName}!</h1>
-      <div className="cbt-timer cbt-timer-final">{formatTime(timeMs)}</div>
+      <p className="cbt-eyebrow">Challenge abgeschlossen</p>
+      <h1 className="cbt-title">Herzlichen Glückwunsch, geschafft!</h1>
       <p className="cbt-sub">
-        Your time has been saved to the leaderboard for {box.title}.
+        Team {team.teamName} · Set {team.setLabel} · {game.title}
       </p>
+      <div className="cbt-timer cbt-timer-final">{formatCountdown(team.remainingMs)}</div>
+      <p className="cbt-sub">verbleibende Zeit – gespeichert in der Rangliste.</p>
       <div className="cbt-board">
-        <h2 className="cbt-board-title">Leaderboard</h2>
+        <h2 className="cbt-board-title">Rangliste · {game.title}</h2>
         {board === null ? (
-          <p className="cbt-sub">Loading results…</p>
+          <p className="cbt-sub">Lade Ergebnisse…</p>
         ) : board.length === 0 ? (
-          <p className="cbt-sub">No results yet.</p>
+          <p className="cbt-sub">Noch keine Ergebnisse.</p>
         ) : (
           <ol className="cbt-board-list">
             {board.map((e, i) => (
               <li
-                key={`${e.teamName}-${e.finishedAt}`}
-                className={e.teamName === teamName ? 'cbt-board-me' : ''}
+                key={e.id}
+                className={e.id === team.id ? 'cbt-board-me' : ''}
               >
                 <span className="cbt-board-rank">#{i + 1}</span>
                 <span className="cbt-board-name">
-                  {e.teamName} ({e.players} {e.players === 1 ? 'player' : 'players'})
+                  {e.teamName} · {e.setLabel}
                 </span>
-                <span className="cbt-board-time">{formatTime(e.timeMs)}</span>
+                <span className="cbt-board-time">{formatCountdown(e.remainingMs)}</span>
               </li>
             ))}
           </ol>
         )}
       </div>
       <button className="cbt-btn cbt-btn-ghost" onClick={onRestart}>
-        Register a new team
+        Neues Team registrieren
       </button>
+    </div>
+  );
+}
+
+/* ============================================================
+   Spiel-App (pro QR-Code / Spiel)
+   ============================================================ */
+
+function GameApp({ gameId }) {
+  const game = GAMES[gameId];
+  const [team, setTeam] = useState(null);
+  const [stage, setStage] = useState('loading');
+
+  /* Reconnect: gespeicherte Team-ID laden */
+  useEffect(() => {
+    const savedId = localStorage.getItem(`cbt-team-${gameId}`);
+    if (!savedId) {
+      setStage('register');
+      return;
+    }
+    api(`/team/${savedId}`)
+      .then((t) => {
+        setTeam(t);
+        if (t.status === 'finished') setStage('finished');
+        else if (t.status === 'playing') setStage('playing');
+        else setStage('briefing');
+      })
+      .catch(() => {
+        localStorage.removeItem(`cbt-team-${gameId}`);
+        setStage('register');
+      });
+  }, [gameId]);
+
+  if (!game) return <NotFound />;
+  if (stage === 'loading') {
+    return (
+      <div className="cbt-card">
+        <p className="cbt-sub">Lade…</p>
+      </div>
+    );
+  }
+
+  const saveTeam = (t) => localStorage.setItem(`cbt-team-${gameId}`, t.id);
+
+  const restart = () => {
+    localStorage.removeItem(`cbt-team-${gameId}`);
+    setTeam(null);
+    setStage('register');
+  };
+
+  return (
+    <>
+      {stage === 'register' && (
+        <Register
+          game={game}
+          gameId={gameId}
+          onRegistered={(t) => {
+            saveTeam(t);
+            setTeam(t);
+            setStage('briefing');
+          }}
+        />
+      )}
+      {stage === 'briefing' && (
+        <Briefing game={game} onDone={() => setStage('ready')} />
+      )}
+      {stage === 'ready' && (
+        <Ready
+          game={game}
+          onYes={() => setStage('question')}
+          onNo={() => setStage('briefing')}
+        />
+      )}
+      {stage === 'question' && team && (
+        <Question
+          game={game}
+          team={team}
+          onSolved={(t) => {
+            setTeam(t);
+            setStage('playing');
+          }}
+        />
+      )}
+      {stage === 'playing' && team && (
+        <Playing
+          team={team}
+          onFinish={(t) => {
+            setTeam(t);
+            setStage('finished');
+          }}
+        />
+      )}
+      {stage === 'finished' && team && (
+        <Finished game={game} team={team} onRestart={restart} />
+      )}
+    </>
+  );
+}
+
+/* ============================================================
+   Operator-Dashboard
+   ============================================================ */
+
+function Operator() {
+  const [teams, setTeams] = useState(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    const load = () =>
+      api('/operator')
+        .then((d) => active && setTeams(d))
+        .catch((e) => active && setError(e.message));
+    load();
+    const id = setInterval(load, 5000);
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
+  }, []);
+
+  const reset = async (id, name) => {
+    if (!window.confirm(`Team "${name}" wirklich zurücksetzen? Das Set wird wieder frei.`)) return;
+    try {
+      await api(`/team/${id}`, { method: 'DELETE' });
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  const statusLabel = { registered: 'registriert', playing: 'läuft', finished: 'beendet' };
+
+  return (
+    <div className="cbt-card cbt-card-wide">
+      <p className="cbt-eyebrow">Operator-Dashboard</p>
+      <h1 className="cbt-title">Alle Teams</h1>
+      <p className="cbt-sub">Aktualisiert automatisch alle 5 Sekunden.</p>
+      {error && <p className="cbt-error">{error}</p>}
+      {teams === null ? (
+        <p className="cbt-sub">Lade Teams…</p>
+      ) : teams.length === 0 ? (
+        <p className="cbt-sub">Noch keine Teams registriert.</p>
+      ) : (
+        <div className="cbt-table-wrap">
+          <table className="cbt-table">
+            <thead>
+              <tr>
+                <th>Team</th>
+                <th>Spiel</th>
+                <th>Set</th>
+                <th>Status</th>
+                <th>Restzeit</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {teams.map((t) => (
+                <tr key={t.id} className={t.status === 'playing' ? 'cbt-row-live' : ''}>
+                  <td>{t.teamName}</td>
+                  <td>{t.gameTitle}</td>
+                  <td>{t.setLabel}</td>
+                  <td>{statusLabel[t.status] || t.status}</td>
+                  <td className="cbt-board-time">
+                    {t.status === 'registered' ? '–' : formatCountdown(t.remainingMs)}
+                  </td>
+                  <td>
+                    <button
+                      className="cbt-btn cbt-btn-ghost cbt-btn-small"
+                      onClick={() => reset(t.id, t.teamName)}
+                    >
+                      Zurücksetzen
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
@@ -297,86 +647,45 @@ function Finished({ box, teamName, timeMs, onRestart }) {
 function NotFound() {
   return (
     <div className="cbt-card">
-      <p className="cbt-eyebrow">Oops</p>
-      <h1 className="cbt-title">No challenge found</h1>
+      <p className="cbt-eyebrow">Hoppla</p>
+      <h1 className="cbt-title">Keine Challenge gefunden</h1>
       <p className="cbt-sub">
-        This QR code does not match a Challenge Box. Scan a valid code to begin.
+        Dieser QR-Code passt zu keiner Challenge Box. Bitte einen gültigen Code
+        scannen.
       </p>
       <p className="cbt-sub cbt-sub-small">
-        Available boxes:{' '}
-        {Object.keys(BOXES).map((id) => (
-          <a key={id} href={`#/${id}`}>
-            #/{id}
-          </a>
-        )).reduce((prev, curr) => [prev, ' · ', curr])}
+        Spiele: <a href="#/vinci">Vinci</a> · <a href="#/zodiak">Zodiak</a> ·{' '}
+        <a href="#/operator">Operator-Dashboard</a>
       </p>
     </div>
   );
 }
 
-/* ---------- app ---------- */
+/* ---------- App ---------- */
 
 export default function App() {
-  const boxId = getBoxIdFromHash();
-  const box = BOXES[boxId];
-  const [stage, setStage] = useState(box ? 'register' : 'invalid');
-  const [teamName, setTeamName] = useState('');
-  const [players, setPlayers] = useState(0);
-  const [timeMs, setTimeMs] = useState(0);
+  const [route, setRoute] = useState(getRoute());
 
-  // Reset if the hash changes (another QR code scanned on same device).
   useEffect(() => {
-    const onHashChange = () => {
-      const id = getBoxIdFromHash();
-      setStage(BOXES[id] ? 'register' : 'invalid');
-      setTeamName('');
-      setPlayers(0);
-      setTimeMs(0);
-    };
+    const onHashChange = () => setRoute(getRoute());
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
 
-  if (!box) return <div className="cbt-app"><NotFound /></div>;
-
-  const handleStart = () => setStage('running');
-
-  const handleStop = async (elapsed) => {
-    setTimeMs(elapsed);
-    setStage('done');
-    await saveResult(boxId, teamName, players, elapsed);
-  };
-
-  const handleRestart = () => {
-    setStage('register');
-    setTeamName('');
-    setPlayers(0);
-    setTimeMs(0);
-  };
+  let screen;
+  if (route === 'operator') screen = <Operator />;
+  else if (GAMES[route]) screen = <GameApp gameId={route} />;
+  else screen = <NotFound />;
 
   return (
     <div className="cbt-app">
       <style>{css}</style>
-      {stage === 'register' && (
-        <Register
-          box={box}
-          onConfirm={(name, count) => {
-            setTeamName(name);
-            setPlayers(count);
-            setStage('riddle');
-          }}
-        />
-      )}
-      {stage === 'riddle' && <Riddle box={box} onStart={handleStart} />}
-      {stage === 'running' && <Running box={box} onStop={handleStop} />}
-      {stage === 'done' && (
-        <Finished box={box} teamName={teamName} timeMs={timeMs} onRestart={handleRestart} />
-      )}
+      {screen}
     </div>
   );
 }
 
-/* ---------- styles (Challenge Box Games look) ---------- */
+/* ---------- Styles (Challenge Box Games Look) ---------- */
 
 const css = `
 @import url('https://fonts.googleapis.com/css2?family=Archivo+Black&family=Inter:wght@400;500;600;700&display=swap');
@@ -408,6 +717,14 @@ const css = `
   border-radius: 20px;
   padding: 40px 36px;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  animation: cbt-in 0.35s ease;
+}
+
+.cbt-card-wide { max-width: 960px; }
+
+@keyframes cbt-in {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .cbt-eyebrow {
@@ -452,17 +769,33 @@ const css = `
   line-height: 1.6;
 }
 
-.cbt-sub-small { font-size: 14px; color: #a89f92; }
+.cbt-sub-small { font-size: 13px; color: #a89f92; margin-top: 16px; }
 .cbt-sub-small a { color: #deb887; }
 
-.cbt-prompt {
-  margin: 8px 0 28px;
-  font-size: 19px;
-  line-height: 1.7;
-  color: #ffd39b;
-  border-left: 3px solid #b65d00;
-  padding-left: 16px;
+.cbt-swipe-number {
+  font-family: 'Archivo Black', 'Inter', sans-serif;
+  color: #b65d00;
+  font-size: 20px;
+  margin: 0 0 8px;
 }
+
+.cbt-swipe { animation: cbt-in 0.3s ease; }
+
+.cbt-dots {
+  display: flex;
+  gap: 8px;
+  margin: 4px 0 20px;
+}
+
+.cbt-dots span {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: rgba(222, 184, 135, 0.25);
+  transition: background 0.2s ease;
+}
+
+.cbt-dots .cbt-dot-active { background: #b65d00; }
 
 .cbt-form { display: flex; flex-direction: column; gap: 18px; }
 
@@ -477,7 +810,7 @@ const css = `
   color: #deb887;
 }
 
-.cbt-label input {
+.cbt-label input, .cbt-label select {
   font-family: 'Inter', sans-serif;
   font-size: 17px;
   font-weight: 500;
@@ -490,18 +823,26 @@ const css = `
   padding: 13px 16px;
   outline: none;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  appearance: none;
 }
 
-.cbt-label input:focus {
+.cbt-label select {
+  background-image: linear-gradient(45deg, transparent 50%, #deb887 50%),
+    linear-gradient(135deg, #deb887 50%, transparent 50%);
+  background-position: calc(100% - 20px) 50%, calc(100% - 14px) 50%;
+  background-size: 6px 6px;
+  background-repeat: no-repeat;
+  cursor: pointer;
+}
+
+.cbt-label input:focus, .cbt-label select:focus {
   border-color: #b65d00;
   box-shadow: 0 0 0 3px rgba(182, 93, 0, 0.25);
 }
 
-.cbt-label input.cbt-wrong { border-color: #cf2e2e; }
+.cbt-label input.cbt-wrong, .cbt-label select.cbt-wrong { border-color: #cf2e2e; }
 
-.cbt-shake {
-  animation: cbt-shake 0.4s ease;
-}
+.cbt-shake { animation: cbt-shake 0.4s ease; }
 
 @keyframes cbt-shake {
   0%, 100% { transform: translateX(0); }
@@ -539,15 +880,27 @@ const css = `
 
 .cbt-btn:active { transform: translateY(0); }
 
+.cbt-btn:disabled { opacity: 0.6; cursor: wait; }
+
 .cbt-btn-ghost {
   background: transparent;
   color: #deb887;
   border: 1px solid rgba(222, 184, 135, 0.45);
 }
 
+.cbt-btn-small { padding: 8px 16px; font-size: 12px; margin-top: 0; }
+
+.cbt-btn-row {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.cbt-btn-row .cbt-btn { flex: 1; min-width: 140px; }
+
 .cbt-timer {
   font-family: 'Archivo Black', 'Inter', sans-serif;
-  font-size: clamp(64px, 16vw, 120px);
+  font-size: clamp(56px, 14vw, 110px);
   text-align: center;
   color: #ffd39b;
   text-shadow: 0 0 40px rgba(182, 93, 0, 0.55);
@@ -555,7 +908,9 @@ const css = `
   font-variant-numeric: tabular-nums;
 }
 
-.cbt-timer-final { color: #ffbc7d; }
+.cbt-timer-low { color: #f78da7; text-shadow: 0 0 40px rgba(207, 46, 46, 0.5); }
+
+.cbt-timer-final { color: #ffbc7d; font-size: clamp(44px, 10vw, 84px); }
 
 .cbt-board {
   margin: 0 0 24px;
@@ -613,8 +968,33 @@ const css = `
   font-weight: 700;
 }
 
+.cbt-table-wrap { overflow-x: auto; }
+
+.cbt-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 15px;
+}
+
+.cbt-table th {
+  text-align: left;
+  font-family: 'Archivo Black', 'Inter', sans-serif;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #deb887;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(222, 184, 135, 0.3);
+}
+
+.cbt-table td {
+  padding: 12px;
+  border-bottom: 1px solid rgba(222, 184, 135, 0.12);
+}
+
+.cbt-row-live { background: rgba(182, 93, 0, 0.08); }
+
 @media (max-width: 480px) {
   .cbt-card { padding: 28px 20px; }
-  .cbt-prompt { font-size: 17px; }
 }
 `;
